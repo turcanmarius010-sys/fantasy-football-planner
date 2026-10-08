@@ -21,6 +21,7 @@ import asyncio
 import difflib
 import hashlib
 import itertools
+import math
 import os
 import time
 from typing import Any
@@ -70,6 +71,14 @@ async def fetch_json(path: str) -> Any:
 POS = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 FDR_MULT = {1: 1.25, 2: 1.12, 3: 1.0, 4: 0.88, 5: 0.78}
 HORIZON_DEFAULT = 5
+# FPL scoring: points per goal by position, clean sheet points, defensive contribution thresholds
+GOAL_PTS = {1: 10, 2: 6, 3: 5, 4: 4}
+CS_PTS = {1: 4, 2: 4, 3: 1, 4: 0}
+DC_THRESHOLD = {1: 99, 2: 10, 3: 12, 4: 12}
+# position averages used while a player has few minutes
+PRIOR_XG = {1: 0.0, 2: 0.04, 3: 0.15, 4: 0.35}
+PRIOR_XA = {1: 0.01, 2: 0.06, 3: 0.15, 4: 0.12}
+PRIOR_DC = {1: 0.0, 2: 9.0, 3: 7.0, 4: 3.0}
 
 
 def _f(value: Any) -> float:
@@ -126,18 +135,28 @@ class Model:
     def price(self, pid: int) -> float:
         return self.players[pid]["now_cost"] / 10
 
-    def base_points(self, p: dict) -> float:
-        """Expected points for an average (FDR 3) fixture, if fit."""
-        minutes_share = min(1.0, _f(p["minutes"]) / (90 * self.finished_gws))
-        ep = _f(p.get("ep_next"))
-        form = _f(p.get("form"))
-        ppg = _f(p.get("points_per_game")) * (0.4 + 0.6 * minutes_share)
-        # early in the season form is noisy, so trust FPL's own expected points more
-        k = min(1.0, self.finished_gws / 4)
-        w_form = 0.35 * k
-        if ep > 0:
-            return (0.45 + 0.35 - w_form) * ep + w_form * form + 0.20 * ppg
-        return 0.5 * (k * form + (1 - k) * ppg) + 0.5 * ppg
+    def per90(self, p: dict) -> tuple[float, float, float]:
+        """Expected points per 90 minutes split into (base, attack, defence).
+        Uses expected goals/assists/goals conceded, saves, defensive contributions and bonus,
+        shrunk towards position averages while a player has few minutes."""
+        pos = p["element_type"]
+        m = _f(p.get("minutes"))
+        w = m / (m + 450)
+
+        def sh(value: float, prior: float) -> float:
+            return w * value + (1 - w) * prior
+
+        xg = sh(_f(p.get("expected_goals_per_90")), PRIOR_XG[pos])
+        xa = sh(_f(p.get("expected_assists_per_90")), PRIOR_XA[pos])
+        xgc = sh(_f(p.get("expected_goals_conceded_per_90")), 1.35)
+        saves = sh(_f(p.get("saves_per_90")), 2.8) if pos == 1 else 0.0
+        dc = sh(_f(p.get("defensive_contribution_per_90")), PRIOR_DC[pos])
+        bonus90 = sh(_f(p.get("bonus")) / (m / 90) if m > 0 else 0.0, 0.25)
+        attack = xg * GOAL_PTS[pos] + xa * 3
+        defence = CS_PTS[pos] * math.exp(-xgc) - (0.5 * xgc if pos <= 2 else 0.0) + saves / 3
+        if pos > 1:
+            defence += 2 / (1 + math.exp(-(dc - DC_THRESHOLD[pos]) / 2))
+        return 2 + bonus90, attack, defence
 
     def availability(self, p: dict, step: int) -> float:
         """Chance of playing, step = 0 for next gameweek, 1 for the one after, ..."""
@@ -156,14 +175,24 @@ class Model:
         if key in self._proj_cache:
             return self._proj_cache[key]
         p = self.players[pid]
-        base = self.base_points(p)
-        step = gw - self.next_gw
+        fixtures = self.schedule.get(p["team"], {}).get(gw, [])
+        if not fixtures:
+            self._proj_cache[key] = 0.0
+            return 0.0
+        starts = _f(p.get("starts"))
+        minutes = _f(p.get("minutes"))
+        start_rate = min(1.0, starts / self.finished_gws)
+        mins_per_start = min(90.0, max(60.0, minutes / starts)) if starts > 0 else 25.0
+        base, attack, defence = self.per90(p)
         total = 0.0
-        for _opp, diff, home in self.schedule.get(p["team"], {}).get(gw, []):
-            total += base * FDR_MULT.get(diff, 1.0) * (1.04 if home else 0.97)
-        total *= self.availability(p, step)
-        self._proj_cache[key] = total
-        return total
+        for _opp, diff, home in fixtures:
+            mult = FDR_MULT.get(diff, 1.0) * (1.04 if home else 0.97)
+            total += (base + (attack + defence) * mult) * mins_per_start / 90
+        model = start_rate * total + (1 - start_rate) * 0.3 * len(fixtures)
+        ppg_part = _f(p.get("points_per_game")) * start_rate * len(fixtures)
+        value = (0.85 * model + 0.15 * ppg_part) * self.availability(p, gw - self.next_gw)
+        self._proj_cache[key] = value
+        return value
 
     def proj(self, pid: int, horizon: int) -> float:
         return sum(self.proj_gw(pid, g) for g in self.gws(horizon))
@@ -264,8 +293,9 @@ def track(tool: str, team_id: int | None = None) -> None:
 # Result helper
 # --------------------------------------------------------------------------
 
-DISCLAIMER = ("Projections come from a simple model (form, FPL expected points, minutes, "
-              "fixture difficulty) and are estimates, not guarantees. Not affiliated with the Premier League.")
+DISCLAIMER = ("Projections come from a transparent model (expected goals and assists, clean-sheet odds, "
+              "minutes, bonus, fixture difficulty) and are estimates, not guarantees. "
+              "Not affiliated with the Premier League.")
 
 
 def result(text: str, data: dict) -> types.CallToolResult:
@@ -349,7 +379,8 @@ async def analyze_team(
         })
 
     xi = [s for s in squad if s["starting"]]
-    by_next = sorted(xi, key=lambda s: s["next_gw_proj"], reverse=True)
+    attackers = [s for s in xi if s["position"] in ("MID", "FWD")]
+    by_next = sorted(attackers if len(attackers) >= 2 else xi, key=lambda s: s["next_gw_proj"], reverse=True)
     captain, vice = by_next[0], by_next[1]
     xi_next = sum(s["next_gw_proj"] for s in xi) + captain["next_gw_proj"]
     xi_horizon = sum(s["horizon_proj"] for s in xi)
@@ -669,9 +700,10 @@ async def captain_picks(
         m = await load_model()
         if team_id:
             _entry, picks = await load_squad(m, team_id)
-            pool = [pk["element"] for pk in picks["picks"]]
+            squad = [pk["element"] for pk in picks["picks"]]
+            pool = [pid for pid in squad if m.players[pid]["element_type"] in (3, 4)] or squad
         else:
-            pool = [pid for pid, p in m.players.items() if m.price(pid) >= 5.5]
+            pool = [pid for pid, p in m.players.items() if p["element_type"] in (3, 4) and m.price(pid) >= 5.5]
     except FPLError as e:
         return error(str(e))
     except httpx.HTTPError:
