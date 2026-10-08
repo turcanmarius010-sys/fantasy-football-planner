@@ -1,0 +1,12 @@
+name: keep-alive
+# Pings the server every 10 minutes so the free Render instance does not fall asleep
+# (a sleeping instance takes ~50 s to answer, which is too slow for ChatGPT).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 90 https://fantasy-football-planner.onrender.com/health || true
